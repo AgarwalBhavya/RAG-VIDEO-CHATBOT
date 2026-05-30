@@ -1,0 +1,88 @@
+services:
+  # Qdrant Vector Database (FREE, Self-hosted)
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: rag_qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    environment:
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-default-key}
+    restart: unless-stopped
+    # Removed healthcheck to prevent timeout issues
+
+  # FastAPI Backend
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag_backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    environment:
+      # YouTube API (FREE)
+      - YOUTUBE_API_KEY=${YOUTUBE_API_KEY}
+      
+      # Qdrant (self-hosted)
+      - QDRANT_URL=http://qdrant:6333
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-default-key}
+      
+      # Ollama (FREE, self-hosted, running locally)
+      - OLLAMA_API_URL=${OLLAMA_API_URL:-http://host.docker.internal:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-mistral}
+      
+      # Embeddings (FREE, self-hosted, HuggingFace)
+      - EMBEDDINGS_MODEL=${EMBEDDINGS_MODEL:-BAAI/bge-base-en-v1.5}
+      - EMBEDDINGS_DEVICE=${EMBEDDINGS_DEVICE:-cpu}
+    
+    depends_on:
+      - qdrant
+      # Removed: condition: service_healthy (causes timeout)
+    
+    restart: unless-stopped
+  frontend:
+    image: node:18-alpine
+    container_name: rag_frontend
+    working_dir: /app
+    volumes:
+      - ./src:/app/src
+      - ./index.html:/app/index.html
+      - ./vite.config.js:/app/vite.config.js
+      - ./package.json:/app/package.json
+      - node_modules:/app/node_modules
+    ports:
+      - "5173:5173"
+    command: sh -c "npm install && npm run dev"
+    depends_on:
+      - backend
+    environment:
+      - VITE_API_URL=http://backend:8000  # ← CHANGE: localhost → backend
+    restart: unless-stopped
+    # Removed backend healthcheck to prevent cascade failures
+
+  # React Frontend
+#  frontend:
+#    image: node:18-alpine
+#    container_name: rag_frontend
+#    working_dir: /app
+#    volumes:
+#      - ./src:/app/src                    # Map src directory
+#      - ./index.html:/app/index.html
+#      - ./vite.config.js:/app/vite.config.js
+#      - ./package.json:/app/package.json
+#      - node_modules:/app/node_modules
+#    ports:
+#      - "5173:5173"
+#    command: sh -c "npm install && npm run dev"
+#    depends_on:
+#      - backend
+#    environment:
+#      - VITE_API_URL=http://localhost:8000
+#    restart: unless-stopped
+
+volumes:
+  qdrant_storage:
+  node_modules:

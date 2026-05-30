@@ -1,0 +1,52 @@
+# ============================================
+# RAG Video Chatbot - FREE LOCAL VERSION
+# Uses:
+# - Ollama (Local LLM)
+# - HuggingFace Embeddings
+# - Qdrant Vector DB
+# - FastAPI Backend
+# ============================================
+
+# FastAPI Backend
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.8.0
+httpx>=0.27.0
+python-multipart>=0.0.9
+
+# Environment Variables
+python-dotenv>=1.0.1
+
+# LangChain Ecosystem
+langchain>=0.2.14
+langchain-community>=0.2.12
+langchain-core>=0.2.33
+langchain-text-splitters>=0.2.2
+langsmith>=0.1.99
+
+# LangGraph
+langgraph>=0.2.16
+
+# Vector Database
+qdrant-client>=1.11.1
+langchain-qdrant>=0.1.0
+
+# Embeddings
+sentence-transformers>=3.0.1
+transformers>=4.44.2
+torch>=2.2.0
+
+# Video Transcript & Metadata
+youtube-transcript-api>=0.6.2
+yt-dlp>=2024.8.6
+
+# Async/File Handling
+aiofiles>=24.1.0
+
+# Ollama Integration
+ollama>=0.3.3
+
+# Utilities
+numpy>=1.26.0
+pandas>=2.2.0
+tqdm>=4.66.5

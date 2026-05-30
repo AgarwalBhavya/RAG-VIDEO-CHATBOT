@@ -1,0 +1,552 @@
+"""
+RAG Chatbot Backend - COMPLETELY FREE VERSION
+Fixed for langgraph 0.2.16 and newer dependencies
+Uses: Ollama (free LLM) + HuggingFace (free embeddings) + Qdrant (free vector DB)
+"""
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from typing import Generator, Optional, List, Any
+import json
+import os
+import asyncio
+from datetime import datetime
+import httpx
+
+# LangGraph - Fixed imports for 0.2.16
+from langgraph.graph import StateGraph, START, END
+from typing_extensions import TypedDict
+
+# LangChain
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Qdrant
+from langchain_core.messages import HumanMessage, AIMessage
+
+# Qdrant Vector DB
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams
+
+# Ollama
+import ollama
+
+# Video processing
+from youtube_transcript_api import YouTubeTranscriptApi
+import yt_dlp
+from urllib.parse import urlparse, parse_qs
+
+app = FastAPI()
+
+# ==================== CONFIG ====================
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
+QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral")
+EMBEDDINGS_MODEL = os.getenv("EMBEDDINGS_MODEL", "BAAI/bge-base-en-v1.5")
+EMBEDDINGS_DEVICE = os.getenv("EMBEDDINGS_DEVICE", "cpu")
+
+# Initialize clients
+print(f"🚀 Initializing RAG Chatbot Backend")
+print(f"   Embeddings: {EMBEDDINGS_MODEL}")
+print(f"   Device: {EMBEDDINGS_DEVICE}")
+print(f"   LLM: {OLLAMA_MODEL}")
+print(f"   Ollama URL: {OLLAMA_API_URL}")
+print(f"   Qdrant URL: {QDRANT_URL}")
+
+try:
+    embeddings = HuggingFaceEmbeddings(
+        model_name=EMBEDDINGS_MODEL,
+        model_kwargs={"device": EMBEDDINGS_DEVICE}
+    )
+    print(f"✓ HuggingFace embeddings initialized")
+except Exception as e:
+    print(f"✗ Error initializing embeddings: {e}")
+    embeddings = None
+
+try:
+    qdrant_client = QdrantClient(url=QDRANT_URL)
+    print(f"✓ Qdrant client initialized")
+except Exception as e:
+    print(f"✗ Error connecting to Qdrant: {e}")
+    qdrant_client = None
+
+COLLECTION_NAME = "video_transcripts"
+
+# ==================== DATA MODELS ====================
+class VideoMetadata(BaseModel):
+    video_id: str
+    platform: str
+    title: str
+    creator: str
+    follower_count: int
+    views: int
+    likes: int
+    comments: int
+    duration: int
+    upload_date: str
+    hashtags: List[str]
+    url: str
+
+    @property
+    def engagement_rate(self) -> float:
+        if self.views == 0:
+            return 0
+        return ((self.likes + self.comments) / self.views) * 100
+
+class ChatRequest(BaseModel):
+    video_a_url: str
+    video_b_url: str
+    question: str
+    conversation_history: Optional[List[dict]] = None
+
+# ==================== STATE DEFINITION ====================
+class AgentState(TypedDict):
+    """State management for RAG conversation"""
+    video_a_metadata: dict  # Changed to dict to avoid serialization issues
+    video_a_transcript: str
+    video_b_metadata: dict  # Changed to dict
+    video_b_transcript: str
+    messages: List[dict]
+    current_question: str
+    sources: list
+    answer: str
+
+# ==================== VECTOR DB SETUP ====================
+async def init_vector_db():
+    """Initialize Qdrant collection if not exists"""
+    if not qdrant_client:
+        raise Exception("Qdrant client not initialized")
+
+    try:
+        qdrant_client.get_collection(COLLECTION_NAME)
+        print(f"✓ Qdrant collection '{COLLECTION_NAME}' exists")
+    except:
+        print(f"✓ Creating Qdrant collection '{COLLECTION_NAME}'")
+        qdrant_client.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=VectorParams(size=768, distance=Distance.COSINE),
+        )
+
+# ==================== VIDEO EXTRACTION ====================
+class YouTubeExtractor:
+    @staticmethod
+    def get_video_id(url: str) -> str:
+        """Extract video ID from YouTube URL"""
+        try:
+            if "youtube.com" in url:
+                return parse_qs(urlparse(url).query).get("v", [None])[0]
+            elif "youtu.be" in url:
+                return url.split("/")[-1].split("?")[0]
+            return None
+        except:
+            return None
+
+    @staticmethod
+    async def get_transcript(video_id: str) -> tuple:
+        """Get transcript with timestamps"""
+        try:
+            transcript = YouTubeTranscriptApi.get_transcript(video_id)
+            full_text = " ".join([entry["text"] for entry in transcript])
+            return full_text, transcript
+        except Exception as e:
+            print(f"⚠️  Transcript error: {str(e)}")
+            return "Transcript not available for this video.", []
+
+    @staticmethod
+    async def get_metadata(video_id: str) -> VideoMetadata:
+        """Fetch metadata using YouTube API"""
+        if not YOUTUBE_API_KEY:
+            raise HTTPException(
+                status_code=400,
+                detail="YOUTUBE_API_KEY not set in .env file. Set it and restart."
+            )
+
+        url = "https://www.googleapis.com/youtube/v3/videos"
+        params = {
+            "id": video_id,
+            "part": "snippet,statistics,contentDetails",
+            "key": YOUTUBE_API_KEY
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(url, params=params)
+                data = response.json()
+
+                if not data.get("items"):
+                    raise HTTPException(status_code=404, detail=f"Video {video_id} not found")
+
+                item = data["items"][0]
+                snippet = item["snippet"]
+                stats = item["statistics"]
+                content = item["contentDetails"]
+
+                duration_seconds = YouTubeExtractor._parse_duration(content["duration"])
+
+                description = snippet["description"]
+                hashtags = [word.split()[0] for word in description.split() if word.startswith("#")]
+
+                return VideoMetadata(
+                    video_id=video_id,
+                    platform="youtube",
+                    title=snippet["title"],
+                    creator=snippet["channelTitle"],
+                    follower_count=0,
+                    views=int(stats.get("viewCount", 0)),
+                    likes=int(stats.get("likeCount", 0)),
+                    comments=int(stats.get("commentCount", 0)),
+                    duration=duration_seconds,
+                    upload_date=snippet["publishedAt"],
+                    hashtags=hashtags,
+                    url=f"https://youtube.com/watch?v={video_id}"
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"YouTube API error: {str(e)}")
+
+    @staticmethod
+    def _parse_duration(duration_str: str) -> int:
+        """Parse PT format to seconds"""
+        import re
+        pattern = r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?'
+        match = re.match(pattern, duration_str)
+        if not match:
+            return 0
+        hours, minutes, seconds = match.groups()
+        return (int(hours or 0) * 3600) + (int(minutes or 0) * 60) + int(seconds or 0)
+
+class InstagramExtractor:
+    @staticmethod
+    async def get_transcript_and_metadata(url: str) -> tuple:
+        """Extract metadata from Instagram Reels using yt-dlp"""
+        try:
+            ydl_opts = {'quiet': True, 'no_warnings': True}
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+
+            video_id = info.get("id", url.split("/")[-1])
+            transcript = info.get("description", "Instagram Reel - no transcript available")
+
+            metadata = VideoMetadata(
+                video_id=video_id,
+                platform="instagram",
+                title=info.get("title", "Untitled Reel"),
+                creator=info.get("uploader", "Unknown Creator"),
+                follower_count=0,
+                views=info.get("view_count", 0),
+                likes=info.get("like_count", 0),
+                comments=info.get("comment_count", 0),
+                duration=int(info.get("duration", 0)),
+                upload_date=info.get("upload_date", datetime.now().isoformat()),
+                hashtags=InstagramExtractor._extract_hashtags(info.get("description", "")),
+                url=url
+            )
+
+            return transcript, metadata
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Instagram error: {str(e)}")
+
+    @staticmethod
+    def _extract_hashtags(text: str) -> List[str]:
+        import re
+        return re.findall(r"#\w+", text)
+
+# ==================== OLLAMA LLM WRAPPER ====================
+async def ollama_generate(prompt: str, system_prompt: str = None) -> str:
+    """Call Ollama LLM"""
+    try:
+        full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
+
+        response = ollama.generate(
+            model=OLLAMA_MODEL,
+            prompt=full_prompt,
+            stream=False,
+        )
+
+        return response.get("response", "").strip()
+    except Exception as e:
+        error_msg = f"Error calling Ollama: {str(e)}\n"
+        error_msg += f"Make sure Ollama is running: ollama serve\n"
+        error_msg += f"Model available: Check with: ollama list"
+        return error_msg
+
+# ==================== VECTOR OPERATIONS ====================
+def retrieve_relevant_chunks(question: str, video_ids: list) -> dict:
+    """Retrieve most relevant chunks from vector DB"""
+    if not embeddings or not qdrant_client:
+        return {}
+
+    try:
+        vector_store = Qdrant(
+            client=qdrant_client,
+            collection_name=COLLECTION_NAME,
+            embeddings=embeddings
+        )
+
+        docs = vector_store.similarity_search_with_score(question, k=4)
+
+        results = {}
+        for doc, score in docs:
+            video_id = doc.metadata.get("video_id")
+            if video_id not in results:
+                results[video_id] = []
+            results[video_id].append({
+                "text": doc.page_content,
+                "score": score,
+                "metadata": doc.metadata
+            })
+        return results
+    except Exception as e:
+        print(f"Retrieval error: {e}")
+        return {}
+
+# ==================== LANGGRAPH AGENT (SIMPLIFIED FOR 0.2.16) ====================
+class SimpleRAGAgent:
+    """Simplified RAG agent that works with langgraph 0.2.16"""
+
+    def __init__(self):
+        self.graph = self._build_graph()
+
+    def _build_graph(self):
+        """Build the graph using langgraph 0.2.16 API"""
+
+        def retrieve_node(state: AgentState) -> dict:
+            """Retrieve relevant chunks"""
+            question = state.get("current_question", "")
+            video_a_id = state.get("video_a_metadata", {}).get("video_id")
+            video_b_id = state.get("video_b_metadata", {}).get("video_id")
+
+            if video_a_id and video_b_id:
+                sources = retrieve_relevant_chunks(question, [video_a_id, video_b_id])
+            else:
+                sources = {}
+
+            return {"sources": sources}
+
+        async def generate_node(state: AgentState) -> dict:
+            """Generate answer using Ollama"""
+            question = state.get("current_question", "")
+            sources = state.get("sources", {})
+
+            meta_a = state.get("video_a_metadata", {})
+            meta_b = state.get("video_b_metadata", {})
+
+            # Build context
+            context = ""
+            source_list = []
+
+            for video_id, chunks in sources.items():
+                platform = "A" if video_id == meta_a.get("video_id") else "B"
+                for chunk_info in chunks[:2]:
+                    context += f"\n[Video {platform}] {chunk_info['text'][:200]}...\n"
+                    source_list.append({
+                        "video_id": video_id,
+                        "platform": platform,
+                        "chunk": chunk_info['text'][:100],
+                        "score": float(chunk_info['score']) if isinstance(chunk_info['score'], (int, float)) else 0.5
+                    })
+
+            # Prepare metadata
+            metadata_context = f"""
+Video A:
+- Title: {meta_a.get('title', 'Unknown')}
+- Creator: {meta_a.get('creator', 'Unknown')}
+- Views: {meta_a.get('views', 0):,}
+- Likes: {meta_a.get('likes', 0):,}
+- Comments: {meta_a.get('comments', 0):,}
+- Engagement: {((meta_a.get('likes', 0) + meta_a.get('comments', 0)) / max(meta_a.get('views', 1), 1) * 100):.2f}%
+
+Video B:
+- Title: {meta_b.get('title', 'Unknown')}
+- Creator: {meta_b.get('creator', 'Unknown')}
+- Views: {meta_b.get('views', 0):,}
+- Likes: {meta_b.get('likes', 0):,}
+- Comments: {meta_b.get('comments', 0):,}
+- Engagement: {((meta_b.get('likes', 0) + meta_b.get('comments', 0)) / max(meta_b.get('views', 1), 1) * 100):.2f}%
+
+Retrieved Context:
+{context}
+"""
+
+            system_prompt = f"""You are a content strategist analyzing social media videos.
+Answer the question based on the metadata and transcript context provided.
+Be specific and cite which video (A or B) you're referencing.
+
+{metadata_context}"""
+
+            response = await ollama_generate(prompt=question, system_prompt=system_prompt)
+
+            messages = state.get("messages", []) + [{"role": "assistant", "content": response}]
+
+            return {
+                "answer": response,
+                "messages": messages,
+                "sources": source_list
+            }
+
+        # Build graph
+        graph = StateGraph(AgentState)
+        graph.add_node("retrieve", retrieve_node)
+        graph.add_node("generate", generate_node)
+
+        graph.add_edge(START, "retrieve")
+        graph.add_edge("retrieve", "generate")
+        graph.add_edge("generate", END)
+
+        return graph.compile()
+
+    def invoke(self, state: AgentState) -> AgentState:
+        """Run the agent"""
+        return self.graph.invoke(state)
+
+rag_agent = SimpleRAGAgent()
+
+# ==================== API ENDPOINTS ====================
+@app.on_event("startup")
+async def startup():
+    """Initialize on startup"""
+    try:
+        await init_vector_db()
+        print("✓ RAG Chatbot backend started successfully")
+        print(f"  - Embeddings: {EMBEDDINGS_MODEL} on {EMBEDDINGS_DEVICE}")
+        print(f"  - LLM: {OLLAMA_MODEL}")
+        print(f"  - Vector DB: {QDRANT_URL}")
+    except Exception as e:
+        print(f"✗ Startup error: {e}")
+
+@app.post("/ingest")
+async def ingest_videos(video_a_url: str, video_b_url: str):
+    """Ingest and process two videos"""
+    results = {}
+
+    for idx, url in enumerate([video_a_url, video_b_url], 1):
+        video_letter = chr(64 + idx)
+
+        try:
+            if "youtube" in url or "youtu.be" in url:
+                video_id = YouTubeExtractor.get_video_id(url)
+                if not video_id:
+                    raise ValueError("Invalid YouTube URL")
+                transcript, _ = await YouTubeExtractor.get_transcript(video_id)
+                metadata = await YouTubeExtractor.get_metadata(video_id)
+            else:
+                transcript, metadata = await InstagramExtractor.get_transcript_and_metadata(url)
+
+            # Chunk and embed
+            if embeddings is None:
+                raise Exception("Embeddings not initialized")
+
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=500,
+                chunk_overlap=100,
+                separators=["\n\n", "\n", ". ", " "]
+            )
+            chunks = text_splitter.split_text(transcript)
+
+            # Store in vector DB
+            if qdrant_client:
+                vector_store = Qdrant(
+                    client=qdrant_client,
+                    collection_name=COLLECTION_NAME,
+                    embeddings=embeddings
+                )
+
+                for i, chunk in enumerate(chunks):
+                    vector_store.add_texts(
+                        texts=[chunk],
+                        metadatas=[{
+                            "video_id": metadata.video_id,
+                            "platform": metadata.platform,
+                            "chunk_index": i,
+                            "title": metadata.title,
+                            "creator": metadata.creator
+                        }]
+                    )
+
+            results[f"video_{video_letter}"] = {
+                "status": "success",
+                "metadata": metadata.dict(),
+                "chunks": len(chunks),
+                "engagement_rate": metadata.engagement_rate
+            }
+            print(f"✓ Ingested Video {video_letter}: {metadata.title} ({len(chunks)} chunks)")
+
+        except Exception as e:
+            results[f"video_{video_letter}"] = {
+                "status": "error",
+                "error": str(e)
+            }
+            print(f"✗ Error with Video {video_letter}: {str(e)}")
+
+    return results
+
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    """Chat endpoint with streaming"""
+
+    async def stream_response() -> Generator:
+        try:
+            # Ingest videos
+            ingest_result = await ingest_videos(request.video_a_url, request.video_b_url)
+
+            # Check if ingestion was successful
+            if ingest_result["video_a"]["status"] != "success" or ingest_result["video_b"]["status"] != "success":
+                yield json.dumps({
+                    "type": "error",
+                    "error": "Failed to ingest videos"
+                }) + "\n"
+                return
+
+            # Extract metadata
+            meta_a = ingest_result["video_a"]["metadata"]
+            meta_b = ingest_result["video_b"]["metadata"]
+
+            # Create state
+            state: AgentState = {
+                "video_a_metadata": meta_a,
+                "video_a_transcript": "",
+                "video_b_metadata": meta_b,
+                "video_b_transcript": "",
+                "messages": request.conversation_history or [],
+                "current_question": request.question,
+                "sources": [],
+                "answer": ""
+            }
+
+            # Run agent
+            final_state = rag_agent.invoke(state)
+
+            # Stream response
+            yield json.dumps({
+                "type": "answer",
+                "content": final_state.get("answer", "")
+            }) + "\n"
+
+            yield json.dumps({
+                "type": "sources",
+                "sources": final_state.get("sources", [])
+            }) + "\n"
+
+        except Exception as e:
+            yield json.dumps({
+                "type": "error",
+                "error": str(e)
+            }) + "\n"
+
+    return StreamingResponse(stream_response(), media_type="application/x-ndjson")
+
+@app.get("/health")
+async def health():
+    """Health check"""
+    return {
+        "status": "healthy",
+        "llm": OLLAMA_MODEL,
+        "embeddings": EMBEDDINGS_MODEL,
+        "qdrant": "connected" if qdrant_client else "disconnected"
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -1,0 +1,30 @@
+# Secrets
+.env
+cookies.txt
+instagram-cookies.txt
+
+# Node / Frontend
+node_modules/
+dist/
+.vite-inspect/
+
+# Python / Backend
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editors & Systems
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+Thumbs.db
+.DS_Store
